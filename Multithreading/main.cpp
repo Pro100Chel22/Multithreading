@@ -6,10 +6,11 @@
 #include <csignal>
 #include <string>
 #include <random>
+#include <algorithm>
 
 using namespace std;
 
-void signalHandler(int signal) { }
+void signalHandler(int signal) {  }
 
 struct Application
 {
@@ -22,40 +23,53 @@ struct Application
 	}
 };
 
+struct ApplicationStatus
+{
+	Application application;
+	int executionTime;
+};
+
 class ServiceSystem
 {
 	bool active;
 	int minMsGenerator, maxMsGenerator;
 	int minMsDevice, maxMsDevice;
 	int sizeOfQueue;
-	priority_queue<Application> applications;
+	vector<Application> applications;
 	mutex order;
 	thread threadOfGenerator;
 	vector<thread> threadsOfDevices;
-	pair<bool, Application> statusOfGenerator;
-	vector<vector<pair<bool, char>>> statusOfDevices;
+	pair<bool, ApplicationStatus> statusOfGenerator;
+	vector<vector<pair<bool, ApplicationStatus>>> statusOfDevices;
 
 	void push(Application application)
 	{
 		lock_guard<mutex> write(order);
-		applications.push(application);
+		applications.push_back(application);
+
+		sort(applications.begin(), applications.end(), [](Application a, Application b) {
+			return a.priority > b.priority;
+		});
 	}
 	Application getByGroupIdTop(int groupId)
 	{
 		lock_guard<mutex> get(order);
 		if(!applications.empty())
 		{
-			Application top = applications.top();
-			if (top.groupId == groupId)
-			{
-				applications.pop();
-				return top;
+			Application top = { -1, -1 };
+			for (int i = 0; i < applications.size(); i++) {
+				if (applications[i].groupId == groupId) {
+					top = applications[i];
+					applications.erase(applications.begin() + i);
+					break;
+				}
 			}
+			return top;
 		}
 		return Application{ -1, -1 };
 	}
 
-	void generator(pair<bool, Application>& status)
+	void generator(pair<bool, ApplicationStatus>& status)
 	{
 		while (isActive())
 		{
@@ -73,8 +87,9 @@ class ServiceSystem
 				this->push(newApplication);
 
 				status.first = true;
-				status.second = newApplication;
-				this_thread::sleep_for(chrono::milliseconds(timeDis(gen)));
+				status.second.application = newApplication;
+				status.second.executionTime = timeDis(gen);
+				this_thread::sleep_for(chrono::milliseconds(status.second.executionTime));
 			}
 			else
 			{
@@ -82,7 +97,7 @@ class ServiceSystem
 			}
 		}
 	}
-	void device(int groupId, int deviceId, pair<bool, char>& status)
+	void device(int groupId, int deviceId, pair<bool, ApplicationStatus>& status)
 	{
 		while (isActive())
 		{
@@ -94,9 +109,10 @@ class ServiceSystem
 				uniform_int_distribution<int> timeDis(minMsDevice, maxMsDevice);
 
 				status.first = true;
-				status.second = app.priority;
+				status.second.application = app;
+				status.second.executionTime = timeDis(gen);
 
-				this_thread::sleep_for(chrono::milliseconds(timeDis(gen)));
+				this_thread::sleep_for(chrono::milliseconds(status.second.executionTime));
 			}
 			else
 			{
@@ -108,20 +124,6 @@ class ServiceSystem
 public:
 	ServiceSystem(int countOfGroup, int sizeOfQueue, vector<int> countOfDevices, int minMsGen, int maxMsGen, int minMsDev, int maxMsDev)
 	{
-		this->active = true;
-		this->sizeOfQueue = sizeOfQueue;
-	
-		this->threadOfGenerator = thread(&ServiceSystem::generator, this, ref(statusOfGenerator));
-		this->statusOfDevices = vector<vector<pair<bool, char>>>(countOfGroup);
-		for (int i = 0; i < countOfGroup; i++) 
-		{
-			this->statusOfDevices[i] = vector<pair<bool, char>>(countOfDevices[i]);
-			for (int j = 0; j < countOfDevices[i]; j++)
-			{
-				this->threadsOfDevices.push_back(thread(&ServiceSystem::device, this, i, j, ref(statusOfDevices[i][j])));
-			}
-		}
-
 		this->minMsGenerator = minMsGen;
 		this->maxMsGenerator = maxMsGen;
 		this->minMsDevice = minMsDev;
@@ -129,14 +131,28 @@ public:
 
 		if (minMsGenerator < 50) minMsGenerator = 50;
 		if (minMsDevice < 50) minMsDevice = 50;
+
+		this->active = true;
+		this->sizeOfQueue = sizeOfQueue;
+	
+		this->threadOfGenerator = thread(&ServiceSystem::generator, this, ref(statusOfGenerator));
+		this->statusOfDevices = vector<vector<pair<bool, ApplicationStatus>>>(countOfGroup);
+		for (int i = 0; i < countOfGroup; i++) 
+		{
+			this->statusOfDevices[i] = vector<pair<bool, ApplicationStatus>>(countOfDevices[i]);
+			for (int j = 0; j < countOfDevices[i]; j++)
+			{
+				this->threadsOfDevices.push_back(thread(&ServiceSystem::device, this, i, j, ref(statusOfDevices[i][j])));
+			}
+		}
 	}
 	~ServiceSystem()
 	{
-		threadOfGenerator.detach();
+		threadOfGenerator.join();
 
 		for (int i = 0; i < threadsOfDevices.size(); i++)
 		{
-			threadsOfDevices[i].detach();
+			threadsOfDevices[i].join();
 		}
 	}
 
@@ -159,9 +175,10 @@ public:
 			printf("Applications in the queue %d out of %d\n", (int)this->applications.size(), this->sizeOfQueue);
 
 			bool status = statusOfGenerator.first;
-			string groupId = to_string(statusOfGenerator.second.groupId + 1);
-			string priority = to_string(statusOfGenerator.second.priority);
-			printf("Generator %s\n", ((status) ? ("active; the last generated application group id: " + groupId + " priority: " + priority).c_str() : "inactive"));
+			string groupId = to_string(statusOfGenerator.second.application.groupId + 1);
+			string priority = to_string(statusOfGenerator.second.application.priority);
+			string executionTime = to_string(statusOfGenerator.second.executionTime);
+			printf("Generator %s\n", ((status) ? ("active; the last generated application group id: " + groupId + " priority: " + priority + "; sleep time: " + executionTime + "ms").c_str() : "inactive"));
 
 			for (int i = 0; i < statusOfDevices.size(); i++)
 			{
@@ -169,8 +186,9 @@ public:
 				for (int j = 0; j < statusOfDevices[i].size(); j++)
 				{
 					status = statusOfDevices[i][j].first;
-					priority = to_string(int(statusOfDevices[i][j].second));
-					printf("\tDevice %d %s\n", j + 1, ((status) ? (" active; priority of application: " + priority).c_str() : " inactive"));
+					priority = to_string(statusOfDevices[i][j].second.application.priority);
+					executionTime = to_string(statusOfDevices[i][j].second.executionTime);
+					printf("\tDevice %d %s\n", j + 1, ((status) ? (" active; priority of application: " + priority + "; execution time: " + executionTime + "ms").c_str() : " inactive"));
 				}
 			}
 		}
@@ -181,6 +199,7 @@ public:
 
 int main() 
 {
+
 	signal(SIGINT, signalHandler);
 
 	int countOfGroup;
@@ -204,7 +223,7 @@ int main()
 	cout << "Enter the minimum and maximum time for the generator in milliseconds (minimum quantity 50):\n";
 	cin >> minMsGenerator >> maxMsGenerator;
 
-	int minMsDevice, maxMsDevice ;
+	int minMsDevice, maxMsDevice;
 	cout << "Enter the minimum and maximum time for the generator in milliseconds (minimum quantity 50):\n";
 	cin >> minMsDevice >> maxMsDevice;
 
@@ -212,7 +231,7 @@ int main()
 
 	while (System.isActive())
 	{
-		if(GetAsyncKeyState(VK_CONTROL) & 0x8000 and GetAsyncKeyState('C') & 0x8000 || GetAsyncKeyState(VK_ESCAPE))
+		if (GetAsyncKeyState(VK_CONTROL) & 0x8000 and GetAsyncKeyState('C') & 0x8000 || GetAsyncKeyState(VK_ESCAPE))
 		{
 			System.deactivate();
 		}
